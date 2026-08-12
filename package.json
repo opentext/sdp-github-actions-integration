@@ -1,6 +1,6 @@
 {
   "name": "sdp-github-actions-integration",
-  "version": "26.2.2",
+  "version": "26.4.0",
   "description": "A custom action which facilitates the connection between GitHub actions and OpenText SDP / SDM.",
   "main": "src/main.ts",
   "scripts": {

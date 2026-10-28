@@ -93143,6 +93143,7 @@ OctaneClient.createPipeline = (pipelineName, ciServer, jobCiIdPrefix, jobs, para
         .execute()).data[0];
 });
 OctaneClient.getPipelineOrCreate = (pipelineName, ciServer, createOnAbsence = false, jobCiIdPrefix, jobs, parameters) => __awaiter(void 0, void 0, void 0, function* () {
+    var _b;
     _a.LOGGER.debug(`Getting pipeline with {name='${pipelineName}'}...`);
     const pipelineQuery = query_1.default.field('name')
         .equal(_a.escapeOctaneQueryValue(pipelineName))
@@ -93157,7 +93158,22 @@ OctaneClient.getPipelineOrCreate = (pipelineName, ciServer, createOnAbsence = fa
         pipelines.total_count === 0 ||
         pipelines.data.length === 0) {
         if (createOnAbsence) {
-            return yield _a.createPipeline(pipelineName, ciServer, jobCiIdPrefix, jobs, parameters);
+            try {
+                return yield _a.createPipeline(pipelineName, ciServer, jobCiIdPrefix, jobs, parameters);
+            }
+            catch (error) {
+                // A concurrent request may have just created this pipeline; re-fetch instead of failing
+                const retryPipelines = yield _a.octane
+                    .get('pipelines')
+                    .fields('name', 'ci_server', 'root_job')
+                    .query(pipelineQuery)
+                    .execute();
+                if (((_b = retryPipelines === null || retryPipelines === void 0 ? void 0 : retryPipelines.data) === null || _b === void 0 ? void 0 : _b.length) > 0) {
+                    _a.LOGGER.warn(`Pipeline '${pipelineName}' was created concurrently by another request; using the existing one.`);
+                    return retryPipelines.data[0];
+                }
+                throw error;
+            }
         }
         else {
             throw new Error(`Pipeline '${pipelineName}' not found.`);
@@ -93348,15 +93364,15 @@ OctaneClient.getCiJob = (ciId, ciServer) => __awaiter(void 0, void 0, void 0, fu
     return ciJobs.data[0];
 });
 OctaneClient.createCiJob = (ciJob) => __awaiter(void 0, void 0, void 0, function* () {
-    var _b, _c, _d;
-    _a.LOGGER.debug(`Creating job with {ci_id='${ciJob.jobCiId}', ci_server.id='${(_b = ciJob.ciServer) === null || _b === void 0 ? void 0 : _b.id}'}...`);
+    var _c, _d, _e;
+    _a.LOGGER.debug(`Creating job with {ci_id='${ciJob.jobCiId}', ci_server.id='${(_c = ciJob.ciServer) === null || _c === void 0 ? void 0 : _c.id}'}...`);
     const ciJobToCreate = {
         name: ciJob.name,
         parameters: ciJob.parameters,
         ci_id: ciJob.jobCiId,
         ci_server: {
-            id: (_c = ciJob.ciServer) === null || _c === void 0 ? void 0 : _c.id,
-            type: (_d = ciJob.ciServer) === null || _d === void 0 ? void 0 : _d.type
+            id: (_d = ciJob.ciServer) === null || _d === void 0 ? void 0 : _d.id,
+            type: (_e = ciJob.ciServer) === null || _e === void 0 ? void 0 : _e.type
         },
         branch: ciJob.branchName
     };
@@ -93480,7 +93496,12 @@ try {
         githubToken: (0, core_1.getInput)('githubToken'),
         serverBaseUrl: (0, core_1.getInput)('serverBaseUrl'),
         pipelineNamePattern: (0, core_1.getInput)('pipelineNamePattern'),
+        preservePipelineNames: (0, core_1.getInput)('preservePipelineNames').toLowerCase() === 'true',
+        flatPipelineMode: (0, core_1.getInput)('flatPipelineMode').toLowerCase() === 'true',
+        runNamePattern: (0, core_1.getInput)('runNamePattern'),
         testingFramework: (0, core_1.getInput)('testingFramework'),
+        testLevel: (0, core_1.getInput)('testLevel').trim(),
+        testType: (0, core_1.getInput)('testType').trim(),
         unitTestResultsGlobPattern: (0, core_1.getInput)('unitTestResultsGlobPattern'),
         gherkinTestResultsGlobPattern: (0, core_1.getInput)('gherkinTestResultsGlobPattern'),
         logLevel: Number.parseInt((0, core_1.getInput)('logLevel'))
@@ -93682,6 +93703,7 @@ const handlePipelineEvent = (event, repositoryOwner, repositoryName, workflowNam
             yield (0, experimentService_1.loadExperiments)();
             const isWorkflowStarted = eventType == "in_progress" /* ActionsEventType.WORKFLOW_STARTED */;
             const isWorkflowQueued = eventType == "requested" /* ActionsEventType.WORKFLOW_QUEUED */;
+            const flatPipelineMode = (0, config_1.getConfig)().flatPipelineMode;
             const jobs = yield githubClient_1.default.getWorkflowRunJobs(repositoryOwner, repositoryName, workflowRunId);
             const baseUrl = (0, config_1.getConfig)().serverBaseUrl;
             const useOldCiServer = yield isOldCiServer();
@@ -93692,17 +93714,35 @@ const handlePipelineEvent = (event, repositoryOwner, repositoryName, workflowNam
             if (isWorkflowQueued && !useOldCiServer) {
                 yield octaneClient_1.default.updatePluginVersionIfNeeded(ciServerInstanceId, ciServerBody);
             }
-            const shortJobCiIdPrefix = yield (0, pathFormatter_1.buildJobCiIdPrefix)(repositoryOwner, repositoryName, workflowFileName);
-            const jobCiIdPrefix = isWorkflowQueued
+            const usePipelineParentName = eventType != "completed" /* ActionsEventType.WORKFLOW_FINISHED */ || flatPipelineMode;
+            const pipelineName = (0, pipelineDataService_1.buildPipelineName)(event, repositoryOwner, repositoryName, workflowFileName, usePipelineParentName, pipelineNamePattern);
+            const runNamePrefix = (0, config_1.getConfig)().runNamePattern || undefined;
+            // Namespace the CI ID per (parent) pipeline name so unrelated pipelines sharing
+            // this workflow file don't collide on the same root job/branch CI ID. The parent
+            // name is always used so every event type of a run resolves to the same CI ID.
+            const isCiIdNamespaced = (0, config_1.getConfig)().preservePipelineNames || flatPipelineMode;
+            const parentPipelineName = usePipelineParentName
+                ? pipelineName
+                : (0, pipelineDataService_1.buildPipelineName)(event, repositoryOwner, repositoryName, workflowFileName, true, pipelineNamePattern);
+            const shortJobCiIdPrefix = yield (0, pathFormatter_1.buildJobCiIdPrefix)(repositoryOwner, repositoryName, workflowFileName, isCiIdNamespaced ? parentPipelineName : undefined);
+            const jobCiIdPrefix = isWorkflowQueued || flatPipelineMode
                 ? shortJobCiIdPrefix
                 : yield (0, pathFormatter_1.appendBranchName)(shortJobCiIdPrefix, branchName);
-            const pipelineName = (0, pipelineDataService_1.buildPipelineName)(event, repositoryOwner, repositoryName, workflowFileName, eventType != "completed" /* ActionsEventType.WORKFLOW_FINISHED */, pipelineNamePattern);
             if (isWorkflowQueued) {
                 yield (0, migrationService_1.performMigrations)(event, pipelineName, shortJobCiIdPrefix, ciServerBody, branchName);
-                yield (0, pipelineDataService_1.updatePipelineNameIfNeeded)(`${jobCiIdPrefix}*`, ciServerBody, pipelineName);
+                // A namespaced CI ID already embeds the pipeline name, so renaming is never needed;
+                // the wildcard lookup would also match pipelines whose names merely share a prefix.
+                if (!isCiIdNamespaced) {
+                    yield (0, pipelineDataService_1.updatePipelineNameIfNeeded)(`${jobCiIdPrefix}*`, ciServerBody, pipelineName);
+                }
             }
-            let pipelineData = yield (0, pipelineDataService_1.getPipelineData)(pipelineName, ciServerBody, event, isWorkflowQueued, jobCiIdPrefix, jobs, configParameters);
-            if (isWorkflowStarted) {
+            let pipelineData = yield (0, pipelineDataService_1.getPipelineData)(pipelineName, ciServerBody, event, isWorkflowQueued || flatPipelineMode, jobCiIdPrefix, jobs, configParameters);
+            if (isWorkflowStarted && flatPipelineMode) {
+                const startedEvent = (0, ciEventsService_1.generateRootCiEvent)(event, pipelineData, "started" /* CiEventType.STARTED */, jobCiIdPrefix, undefined, undefined, runNamePrefix);
+                yield octaneClient_1.default.sendEvents([startedEvent], pipelineData.instanceId, pipelineData.baseUrl);
+                yield (0, ciJobService_1.updateJobParameters)(pipelineData.rootJobId, configParameters || []);
+            }
+            else if (isWorkflowStarted) {
                 if (!branchName) {
                     throw new Error('Event should contain workflow data!');
                 }
@@ -93718,7 +93758,11 @@ const handlePipelineEvent = (event, repositoryOwner, repositoryName, workflowNam
                     multiBranchType: "CHILD" /* MultiBranchType.CHILD */,
                     parentCiId: `${shortJobCiIdPrefix}`,
                     branch: branchName,
-                    number: (runNumber === null || runNumber === void 0 ? void 0 : runNumber.toString()) || pipelineData.buildCiId,
+                    number: runNumber
+                        ? runNamePrefix
+                            ? `${runNamePrefix}#${runNumber}`
+                            : runNumber.toString()
+                        : pipelineData.buildCiId,
                     skipValidation: true
                 };
                 yield octaneClient_1.default.sendEvents([ciStartedPipelineEvent], pipelineData.instanceId, pipelineData.baseUrl);
@@ -93823,7 +93867,7 @@ const handlePipelineEvent = (event, repositoryOwner, repositoryName, workflowNam
                     const since = new Date(latestPreviousBuild.start_time);
                     const scmData = yield (0, scmDataService_1.collectSCMData)(event, repositoryOwner, repositoryName, since);
                     if (scmData) {
-                        const rootSCMEvent = (0, ciEventsService_1.generateRootCiEvent)(event, pipelineData, "scm" /* CiEventType.SCM */, jobCiIdPrefix, scmData);
+                        const rootSCMEvent = (0, ciEventsService_1.generateRootCiEvent)(event, pipelineData, "scm" /* CiEventType.SCM */, jobCiIdPrefix, scmData, undefined, runNamePrefix);
                         LOGGER.info(`Injecting commits since ${since}...`);
                         yield octaneClient_1.default.sendEvents([rootSCMEvent], pipelineData.instanceId, pipelineData.baseUrl);
                     }
@@ -93836,7 +93880,12 @@ const handlePipelineEvent = (event, repositoryOwner, repositoryName, workflowNam
                 LOGGER.info('Waiting for queued events to finish up...');
                 yield (0, ciEventsService_1.pollForJobsOfTypeToFinish)(repositoryOwner, repositoryName, currentRun, workflowRunId, startTime, "in_progress" /* ActionsEventType.WORKFLOW_STARTED */);
                 const executionParameters = yield (0, parametersService_1.getParametersFromLogs)(repositoryOwner, repositoryName, workflowRunId);
-                const completedEvent = (0, ciEventsService_1.generateRootCiEvent)(event, pipelineData, "finished" /* CiEventType.FINISHED */, jobCiIdPrefix, undefined, executionParameters);
+                if (flatPipelineMode) {
+                    // Ensures the build is marked started even if 'requested'/'in_progress' were never configured
+                    const startedEvent = (0, ciEventsService_1.generateRootCiEvent)(event, pipelineData, "started" /* CiEventType.STARTED */, jobCiIdPrefix, undefined, undefined, runNamePrefix);
+                    yield octaneClient_1.default.sendEvents([startedEvent], pipelineData.instanceId, pipelineData.baseUrl);
+                }
+                const completedEvent = (0, ciEventsService_1.generateRootCiEvent)(event, pipelineData, "finished" /* CiEventType.FINISHED */, jobCiIdPrefix, undefined, executionParameters, runNamePrefix);
                 yield octaneClient_1.default.sendEvents([completedEvent], pipelineData.instanceId, pipelineData.baseUrl);
                 if ((0, config_1.getConfig)().unitTestResultsGlobPattern) {
                     yield (0, testResultsService_1.sendJUnitTestResults)(repositoryOwner, repositoryName, workflowRunId, pipelineData.buildCiId, `${jobCiIdPrefix}`, pipelineData.instanceId, testingFramework);
@@ -94165,13 +94214,14 @@ const getNotFinishedRuns = (owner, repoName, startTime, currentRun) => __awaiter
     runs.push(...(yield githubClient_1.default.getWorkflowRunsTriggeredBeforeByStatus(...params, "waiting" /* WorkflowRunStatus.WAITING */)));
     return runs.filter(run => run.id !== currentRun.id);
 });
-const generateRootCiEvent = (event, pipelineData, eventType, jobCiIdPrefix, scmData, parameters) => {
+const generateRootCiEvent = (event, pipelineData, eventType, jobCiIdPrefix, scmData, parameters, runNamePrefix) => {
     var _a, _b, _c, _d, _e, _f, _g, _h, _j;
+    const runNumber = ((_b = (_a = event.workflow_run) === null || _a === void 0 ? void 0 : _a.run_number) === null || _b === void 0 ? void 0 : _b.toString()) || pipelineData.buildCiId;
     const rootEvent = {
         buildCiId: pipelineData.buildCiId,
         customReportUrl: getWorkflowRunUrl(event),
         eventType,
-        number: ((_b = (_a = event.workflow_run) === null || _a === void 0 ? void 0 : _a.run_number) === null || _b === void 0 ? void 0 : _b.toString()) || pipelineData.buildCiId,
+        number: runNamePrefix ? `${runNamePrefix}#${runNumber}` : runNumber,
         project: `${jobCiIdPrefix}`,
         projectDisplayName: pipelineData.rootJobName,
         startTime: ((_c = event.workflow_run) === null || _c === void 0 ? void 0 : _c.run_started_at)
@@ -95500,6 +95550,7 @@ const githubClient_1 = __importDefault(__nccwpck_require__(7415));
 const octaneClient_1 = __importDefault(__nccwpck_require__(18607));
 const config_1 = __nccwpck_require__(84561);
 const logger_1 = __nccwpck_require__(38836);
+const testFieldOverrides_1 = __nccwpck_require__(72396);
 const FrameworkType_1 = __nccwpck_require__(94863);
 const LOGGER = new logger_1.Logger('testResultsService');
 const ARTIFACTS_DIR = 'artifacts';
@@ -95561,7 +95612,7 @@ const sendJUnitTestResults = (owner, repo, workflowRunId, buildId, jobId, server
         build_id: buildId,
         job_id: jobId
     };
-    yield processArtifacts(owner, repo, workflowRunId, buildContext, (0, config_1.getConfig)().unitTestResultsGlobPattern, alm_octane_test_result_convertion_1.convertJUnitXMLToOctaneXML, framework ? [(0, FrameworkType_1.stringToFrameworkType)(framework)] : undefined);
+    yield processArtifacts(owner, repo, workflowRunId, buildContext, (0, config_1.getConfig)().unitTestResultsGlobPattern, (content, options, ...extraParams) => (0, testFieldOverrides_1.applyTestFieldOverrides)((0, alm_octane_test_result_convertion_1.convertJUnitXMLToOctaneXML)(content, options, ...extraParams), { testLevel: (0, config_1.getConfig)().testLevel, testType: (0, config_1.getConfig)().testType }), framework ? [(0, FrameworkType_1.stringToFrameworkType)(framework)] : undefined);
     LOGGER.info('JUnit test results processed and sent successfully.');
 });
 exports.sendJUnitTestResults = sendJUnitTestResults;
@@ -95874,11 +95925,14 @@ class PathFormatterService {
             ? `${constants_1.GITHUB_ACTIONS_PLUGIN_VERSION}${PathFormatterService.NEW_SEPARATOR}`
             : '';
     }
-    static buildJobCiIdPrefix(repositoryOwner, repositoryName, workflowFileName) {
+    static buildJobCiIdPrefix(repositoryOwner, repositoryName, workflowFileName, pipelineNamespace) {
         return __awaiter(this, void 0, void 0, function* () {
             yield PathFormatterService.checkVersion();
             const separator = PathFormatterService.getSeparator();
-            return `${PathFormatterService.getPrefix()}${repositoryOwner}${separator}${repositoryName}${separator}${workflowFileName}`;
+            const prefix = `${PathFormatterService.getPrefix()}${repositoryOwner}${separator}${repositoryName}${separator}${workflowFileName}`;
+            return pipelineNamespace
+                ? `${prefix}${separator}${pipelineNamespace}`
+                : prefix;
         });
     }
     static buildExecutorCiId(repositoryOwner, repositoryName, workflowFileName, branchName) {
@@ -95909,6 +95963,84 @@ PathFormatterService.OLD_SEPARATOR = '/';
 PathFormatterService.JOB_CI_ID_EXECUTOR = 'executor';
 PathFormatterService.VERSION_THRESHOLD = '26.1.23';
 exports.NEW_SEPARATOR = PathFormatterService.NEW_SEPARATOR, exports.buildJobCiIdPrefix = PathFormatterService.buildJobCiIdPrefix, exports.buildExecutorCiId = PathFormatterService.buildExecutorCiId, exports.appendBranchName = PathFormatterService.appendBranchName, exports.appendJobName = PathFormatterService.appendJobName;
+
+
+/***/ }),
+
+/***/ 72396:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/*
+ * Copyright 2022-2025 Open Text.
+ *
+ * The only warranties for products and services of Open Text and
+ * its affiliates and licensors (“Open Text”) are as may be set forth
+ * in the express warranty statements accompanying such products and services.
+ * Nothing herein should be construed as constituting an additional warranty.
+ * Open Text shall not be liable for technical or editorial errors or
+ * omissions contained herein. The information contained herein is subject
+ * to change without notice.
+ *
+ * Except as specifically indicated otherwise, this document contains
+ * confidential information and a valid license is required for possession,
+ * use or copying. If this work is provided to the U.S. Government,
+ * consistent with FAR 12.211 and 12.212, Commercial Computer Software,
+ * Computer Software Documentation, and Technical Data for Commercial Items are
+ * licensed to the U.S. Government under vendor's standard commercial license.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.applyTestFieldOverrides = void 0;
+const escapeXmlAttribute = (value) => value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const setTestField = (testFieldsXml, type, value) => {
+    const newField = `<test_field type="${type}" value="${escapeXmlAttribute(value)}"/>`;
+    const existingField = new RegExp(`<test_field\\s+type="${escapeRegExp(type)}"[^>]*?/>`);
+    return existingField.test(testFieldsXml)
+        ? testFieldsXml.replace(existingField, () => newField)
+        : testFieldsXml.replace('</test_fields>', () => `${newField}</test_fields>`);
+};
+/**
+ * Overrides the Test_Level / Test_Type test fields of a converted test results XML.
+ * Only the <test_fields> block is touched, so the rest of the payload (test names,
+ * error messages etc.) is preserved byte-for-byte; a full parse/serialize round-trip
+ * would lose XML escaping of those values.
+ */
+const applyTestFieldOverrides = (octaneXml, overrides) => {
+    var _a, _b;
+    const testLevel = (_a = overrides.testLevel) === null || _a === void 0 ? void 0 : _a.trim();
+    const testType = (_b = overrides.testType) === null || _b === void 0 ? void 0 : _b.trim();
+    if (!testLevel && !testType) {
+        return octaneXml;
+    }
+    return octaneXml.replace(/<test_fields>[\s\S]*?<\/test_fields>/, testFieldsXml => {
+        let updated = testFieldsXml;
+        if (testLevel) {
+            updated = setTestField(updated, 'Test_Level', testLevel);
+        }
+        if (testType) {
+            updated = setTestField(updated, 'Test_Type', testType);
+        }
+        return updated;
+    });
+};
+exports.applyTestFieldOverrides = applyTestFieldOverrides;
 
 
 /***/ }),

@@ -12,8 +12,13 @@ This is a custom GitHub Action which facilitates communication between GitHub an
 - [4. Workflow Configuration](#4-workflow-configuration)
   - [4.1. Example Workflow Configuration](#41-example-workflow-configuration)
   - [4.2. Pipeline name pattern](#42-pipeline-name-pattern)
-  - [4.3. Injecting Gherkin (BDD) test results](#43-injecting-gherkin-bdd-test-results)
-  - [4.4. Debugging](#44-debugging)
+    - [4.2.1. Preserving existing pipeline names](#421-preserving-existing-pipeline-names)
+    - [4.2.2. Flat pipeline mode (no branch/child pipelines)](#422-flat-pipeline-mode-no-branchchild-pipelines)
+    - [4.2.3. Custom run/build labels](#423-custom-runbuild-labels)
+    - [4.2.4. Tracking quality per microservice or group of microservices](#424-tracking-quality-per-microservice-or-group-of-microservices)
+  - [4.3. Test Level and Test Type of JUnit test results](#43-test-level-and-test-type-of-junit-test-results)
+  - [4.4. Injecting Gherkin (BDD) test results](#44-injecting-gherkin-bdd-test-results)
+  - [4.5. Debugging](#45-debugging)
 - [5. Credential Configuration](#5-credential-configuration-into-the-product)
   - [5.1. Creating a GitHub App](#51-creating-a-github-app)
   - [5.2. Installing a GitHub App to specific repositories](#52-installing-a-github-app-to-specific-repositories)
@@ -23,6 +28,7 @@ This is a custom GitHub Action which facilitates communication between GitHub an
 - [8. Limitations](#8-limitations)
   - [8.1. Duplicate Workflow Run Protection](#81-duplicate-workflow-run-protection)
 - [9. Change log](#9-change-log)
+  - [Unreleased](#unreleased)
   - [v26.4.0](#v2640)
   - [v26.2.2](#v2622)
   - [v26.2.1](#v2621)
@@ -185,8 +191,114 @@ jobs:
 
 - Example: `NEW - ${repository_name} - ${workflow_name}`
 
+#### 4.2.1. Preserving existing pipeline names
 
-### 4.3. Injecting Gherkin (BDD) test results
+- By default, whenever a pipeline is created or updated, the integration searches for any other pipelines sharing the same root job CI ID and renames them to match the currently resolved `pipelineNamePattern`. This keeps a single pipeline in sync when its name changes over time.
+- If `pipelineNamePattern` resolves to a **different name across separate workflow runs that share the same root job CI ID** (for example, a name computed dynamically per component or matrix job), this automatic renaming can incorrectly rename or reuse an unrelated pipeline.
+- To prevent this, set the optional `preservePipelineNames` parameter to `true`. When enabled, the integration will still create or retrieve the pipeline using the current `pipelineNamePattern`, but it will **not** rename any other existing pipelines.
+- This parameter is **optional** and defaults to `false`, preserving the existing renaming behavior for backward compatibility.
+- When enabled, the plugin also namespaces the underlying job/build CI ID by the resolved (parent) pipeline name, so that different pipelines sharing the same GitHub workflow file get fully independent CI identities (preventing them from colliding on the same underlying job/build). The same CI ID is used for the `requested`, `in_progress` and `completed` events of a run.
+
+> [!IMPORTANT]
+> Because the CI ID changes when this option is enabled, the first run afterwards creates a **new** pipeline in the product; the history of the previous pipeline is not migrated. Likewise, changing the resolved pipeline name later creates a new pipeline instead of renaming the existing one.
+
+```yaml
+with:
+  ...
+  pipelineNamePattern: '${workflow_name}'
+  preservePipelineNames: 'true'
+```
+
+#### 4.2.2. Flat pipeline mode (no branch/child pipelines)
+
+- By default, when a workflow run starts (`in_progress`), the integration creates a **branch/child pipeline** under the parent (e.g. `my-pipeline/main`) and reports the run against it, so per-branch history and live job/step progress are tracked separately from the parent pipeline.
+- If you don't need per-branch pipeline tracking (for example, you just want test results grouped per pipeline/component, without live progress tracking), set the optional `flatPipelineMode` parameter to `true`. When enabled:
+  - No branch/child pipeline is ever created; the run is reported directly against the parent pipeline.
+  - Live job/step progress polling still runs as normal during `in_progress` (unaffected).
+  - If your workflow only sends the `completed` event (omitting `requested` and `in_progress` from the `workflow_run` `types:` list), the integration will create the pipeline on first use if it doesn't already exist, and will send both a `started` and `finished` event for that run — so a `completed`-only setup works out of the box.
+  - The `completed` event always sends a `started` event before `finished`. If `in_progress` is also configured, the build therefore receives a second `started` event with the same build ID and start time, which simply updates the existing build.
+  - The job/build CI ID is namespaced by the resolved pipeline name and existing pipelines are never renamed, exactly as with [`preservePipelineNames`](#421-preserving-existing-pipeline-names) (including the note about new pipelines being created when the option is first enabled).
+- This parameter is **optional** and defaults to `false`, preserving the existing branch/child pipeline behavior for backward compatibility.
+
+```yaml
+with:
+  ...
+  pipelineNamePattern: '${workflow_name}'
+  flatPipelineMode: 'true'
+```
+
+> [!TIP]
+> If your `workflow_run` trigger only includes `completed` (no `requested`/`in_progress`), you must set `flatPipelineMode: 'true'` for the pipeline to be created and reported correctly.
+
+#### 4.2.3. Custom run/build labels
+
+- By default, each run/build in the product is labeled with just the GitHub Actions run number (e.g. `#44`).
+- If you group multiple distinct components/microservices under a single pipeline (for example, using a constant `pipelineNamePattern` together with `flatPipelineMode`), it can be useful to distinguish each run by which component produced it. Set the optional `runNamePattern` parameter to an already-resolved label (e.g. a component/microservice name) to prefix the run number: `<runNamePattern>#<run_number>`.
+- This parameter expects an **already-resolved plain string** (like `pipelineNamePattern`), not a template — resolve any dynamic value in your calling workflow before passing it in.
+- This parameter is **optional**. If not set, runs keep the default label (just the run number).
+
+```yaml
+with:
+  ...
+  pipelineNamePattern: 'module-name'
+  flatPipelineMode: 'true'
+  runNamePattern: 'microservice-name'
+```
+
+> [!NOTE]
+> This is an experimental option — verify in the product's UI that the run label renders as expected for your version, since the exact display format is controlled by the product, not this integration.
+
+#### 4.2.4. Tracking quality per microservice or group of microservices
+
+Pipeline dashboards and widgets in the product (e.g. pipeline run history, test run results, failure analysis) are scoped per pipeline. To get a dashboard per microservice, or per group of microservices, each one needs a stable pipeline of its own, even when several services are built by the same (reusable) GitHub workflow. Two setups are supported:
+
+**A. One pipeline per microservice.** Resolve `pipelineNamePattern` to the service name and enable `preservePipelineNames`, so that each service gets its own pipeline and the services never rename each other's pipeline. For example, if the upstream workflow sets `run-name: ${{ inputs.service }}`:
+
+```yaml
+with:
+  ...
+  pipelineNamePattern: '${{ github.event.workflow_run.display_title }}'
+  preservePipelineNames: 'true'
+  testLevel: 'Integration Test'
+  testType: 'Regression'
+```
+
+**B. One pipeline per group of microservices.** Resolve `pipelineNamePattern` to the group (module) name, enable `flatPipelineMode` so that all runs land directly in that single pipeline, and set `runNamePattern` to the service name so each run shows which service produced it:
+
+```yaml
+with:
+  ...
+  pipelineNamePattern: 'payments-module'
+  flatPipelineMode: 'true'
+  runNamePattern: '${{ github.event.workflow_run.display_title }}'
+```
+
+In both setups, use [`testLevel` / `testType`](#43-test-level-and-test-type-of-junit-test-results) to classify the injected test results, so that dashboard widgets can be filtered by test level and type.
+
+### 4.3. Test Level and Test Type of JUnit test results
+
+- By default, the injected **JUnit** test results are reported with `Test_Level` = `Unit Test` and `Test_Type` = `Sanity`.
+- Set the optional `testLevel` and/or `testType` parameters to override these values (e.g. `System Test`, `Functional`). Each parameter is applied independently; when a parameter is not set, the default value is kept.
+- The values should match existing values of the corresponding lists in the product.
+- The `Framework` field is not affected and is still derived from `testingFramework`. Gherkin (BDD) test results are not affected either.
+
+```yaml
+with:
+  octaneUrl: ...
+  octaneSharedSpace: ...
+  octaneWorkspace: ...
+  octaneClientId: ...
+  octaneClientSecret: ...
+  gitHubToken: ...
+  serverBaseUrl: ...
+  pipelineNamePattern: '${workflow_name}'
+  unitTestResultsGlobPattern: 'results.xml'
+  testingFramework: 'robotFramework'
+  testLevel: 'System Test'
+  testType: 'Functional'
+```
+
+### 4.4. Injecting Gherkin (BDD) test results
 
 - To inject **Gherkin** test results, follow these steps:
   1. The automation workflow must contain an additional step for converting the BDD test results to a format accepted by the product. This step must run the [bdd2octane](https://github.com/MicroFocus/bdd2octane?tab=readme-ov-file#a-tool-that-enables-importing-bdd-test-results-into-alm-octane) tool.
@@ -196,7 +308,7 @@ jobs:
   ```
   2. Set up the `gherkinTestResultsGlobPattern` parameter in the integration workflow to match the converted test results.
 
-### 4.4. Debugging
+### 4.5. Debugging
 
 - In order to get more information on the execution of the integration workflow, add this parameter for the integration job: `logLevel: '3'`.
 - These are the available values for this parameter:
@@ -328,6 +440,16 @@ The integration now includes a **deployment lock mechanism** that automatically 
 To disable this feature (if needed for compatibility or specific use cases), set the `SDP_ENABLE_DEPLOYMENT_LOCK` environment variable to `false` in your integration job configuration.
 
 ## 9. Change log
+
+### Unreleased
+
+- Added an optional `preservePipelineNames` parameter. When set to `true`, the integration no longer renames existing pipelines that share the same root job CI ID as the currently resolved `pipelineNamePattern`. Defaults to `false` to preserve existing behavior.
+- When `preservePipelineNames` or `flatPipelineMode` is enabled, the CI ID used for pipelines/jobs is now namespaced by the resolved (parent) pipeline name, preventing distinct pipelines that share the same GitHub workflow file from colliding on the same underlying job/build CI ID. All `workflow_run` event types of a run resolve to the same pipeline and CI ID.
+- Added an optional `flatPipelineMode` parameter. When set to `true`, the integration no longer creates branch/child pipelines and instead reports runs directly against the parent pipeline; supports `workflow_run` triggers configured with only the `completed` event type, or any subset of `requested`/`in_progress`/`completed`. Defaults to `false` to preserve existing behavior.
+- Made pipeline creation resilient to concurrent create-on-absence races: if two runs targeting a not-yet-existing pipeline fire close together, the losing request now re-fetches and reuses the pipeline created by the other, instead of diverging into an inconsistent state.
+- Added an optional `runNamePattern` parameter to customize the run/build label sent to the product (`<runNamePattern>#<run_number>`), useful when grouping multiple components under a single pipeline. The label is unchanged if not set. Experimental — verify rendering in the product's UI.
+- Added optional `testLevel` and `testType` parameters to override the `Test_Level` (default `Unit Test`) and `Test_Type` (default `Sanity`) fields of injected JUnit test results.
+- Documented how to track pipeline quality per microservice or group of microservices.
 
 ### v26.4.0
 

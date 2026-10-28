@@ -279,6 +279,7 @@ const handlePipelineEvent = async (
 
       const isWorkflowStarted = eventType == ActionsEventType.WORKFLOW_STARTED;
       const isWorkflowQueued = eventType == ActionsEventType.WORKFLOW_QUEUED;
+      const flatPipelineMode = getConfig().flatPipelineMode;
 
       const jobs = await GitHubClient.getWorkflowRunJobs(
         repositoryOwner,
@@ -316,23 +317,45 @@ const handlePipelineEvent = async (
         );
       }
 
-      const shortJobCiIdPrefix = await buildJobCiIdPrefix(
-        repositoryOwner,
-        repositoryName,
-        workflowFileName
-      );
-      const jobCiIdPrefix = isWorkflowQueued
-        ? shortJobCiIdPrefix
-        : await appendBranchName(shortJobCiIdPrefix, branchName);
-
+      const usePipelineParentName =
+        eventType != ActionsEventType.WORKFLOW_FINISHED || flatPipelineMode;
       const pipelineName = buildPipelineName(
         event,
         repositoryOwner,
         repositoryName,
         workflowFileName,
-        eventType != ActionsEventType.WORKFLOW_FINISHED,
+        usePipelineParentName,
         pipelineNamePattern
       );
+
+      const runNamePrefix = getConfig().runNamePattern || undefined;
+
+      // Namespace the CI ID per (parent) pipeline name so unrelated pipelines sharing
+      // this workflow file don't collide on the same root job/branch CI ID. The parent
+      // name is always used so every event type of a run resolves to the same CI ID.
+      const isCiIdNamespaced =
+        getConfig().preservePipelineNames || flatPipelineMode;
+      const parentPipelineName = usePipelineParentName
+        ? pipelineName
+        : buildPipelineName(
+            event,
+            repositoryOwner,
+            repositoryName,
+            workflowFileName,
+            true,
+            pipelineNamePattern
+          );
+
+      const shortJobCiIdPrefix = await buildJobCiIdPrefix(
+        repositoryOwner,
+        repositoryName,
+        workflowFileName,
+        isCiIdNamespaced ? parentPipelineName : undefined
+      );
+      const jobCiIdPrefix =
+        isWorkflowQueued || flatPipelineMode
+          ? shortJobCiIdPrefix
+          : await appendBranchName(shortJobCiIdPrefix, branchName);
 
       if (isWorkflowQueued) {
         await performMigrations(
@@ -343,24 +366,49 @@ const handlePipelineEvent = async (
           branchName
         );
 
-        await updatePipelineNameIfNeeded(
-          `${jobCiIdPrefix}*`,
-          ciServerBody,
-          pipelineName
-        );
+        // A namespaced CI ID already embeds the pipeline name, so renaming is never needed;
+        // the wildcard lookup would also match pipelines whose names merely share a prefix.
+        if (!isCiIdNamespaced) {
+          await updatePipelineNameIfNeeded(
+            `${jobCiIdPrefix}*`,
+            ciServerBody,
+            pipelineName
+          );
+        }
       }
 
       let pipelineData = await getPipelineData(
         pipelineName,
         ciServerBody,
         event,
-        isWorkflowQueued,
+        isWorkflowQueued || flatPipelineMode,
         jobCiIdPrefix,
         jobs,
         configParameters
       );
 
-      if (isWorkflowStarted) {
+      if (isWorkflowStarted && flatPipelineMode) {
+        const startedEvent = generateRootCiEvent(
+          event,
+          pipelineData,
+          CiEventType.STARTED,
+          jobCiIdPrefix,
+          undefined,
+          undefined,
+          runNamePrefix
+        );
+
+        await OctaneClient.sendEvents(
+          [startedEvent],
+          pipelineData.instanceId,
+          pipelineData.baseUrl
+        );
+
+        await updateJobParameters(
+          pipelineData.rootJobId,
+          configParameters || []
+        );
+      } else if (isWorkflowStarted) {
         if (!branchName) {
           throw new Error('Event should contain workflow data!');
         }
@@ -379,7 +427,11 @@ const handlePipelineEvent = async (
           multiBranchType: MultiBranchType.CHILD,
           parentCiId: `${shortJobCiIdPrefix}`,
           branch: branchName,
-          number: runNumber?.toString() || pipelineData.buildCiId,
+          number: runNumber
+            ? runNamePrefix
+              ? `${runNamePrefix}#${runNumber}`
+              : runNumber.toString()
+            : pipelineData.buildCiId,
           skipValidation: true
         };
 
@@ -596,7 +648,9 @@ const handlePipelineEvent = async (
               pipelineData,
               CiEventType.SCM,
               jobCiIdPrefix,
-              scmData
+              scmData,
+              undefined,
+              runNamePrefix
             );
 
             LOGGER.info(`Injecting commits since ${since}...`);
@@ -630,13 +684,33 @@ const handlePipelineEvent = async (
           workflowRunId
         );
 
+        if (flatPipelineMode) {
+          // Ensures the build is marked started even if 'requested'/'in_progress' were never configured
+          const startedEvent = generateRootCiEvent(
+            event,
+            pipelineData,
+            CiEventType.STARTED,
+            jobCiIdPrefix,
+            undefined,
+            undefined,
+            runNamePrefix
+          );
+
+          await OctaneClient.sendEvents(
+            [startedEvent],
+            pipelineData.instanceId,
+            pipelineData.baseUrl
+          );
+        }
+
         const completedEvent = generateRootCiEvent(
           event,
           pipelineData,
           CiEventType.FINISHED,
           jobCiIdPrefix,
           undefined,
-          executionParameters
+          executionParameters,
+          runNamePrefix
         );
 
         await OctaneClient.sendEvents(

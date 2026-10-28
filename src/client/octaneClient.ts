@@ -225,13 +225,31 @@ export default class OctaneClient {
       pipelines.data.length === 0
     ) {
       if (createOnAbsence) {
-        return await this.createPipeline(
-          pipelineName,
-          ciServer,
-          jobCiIdPrefix,
-          jobs,
-          parameters
-        );
+        try {
+          return await this.createPipeline(
+            pipelineName,
+            ciServer,
+            jobCiIdPrefix,
+            jobs,
+            parameters
+          );
+        } catch (error) {
+          // A concurrent request may have just created this pipeline; re-fetch instead of failing
+          const retryPipelines = await this.octane
+            .get('pipelines')
+            .fields('name', 'ci_server', 'root_job')
+            .query(pipelineQuery)
+            .execute();
+
+          if (retryPipelines?.data?.length > 0) {
+            this.LOGGER.warn(
+              `Pipeline '${pipelineName}' was created concurrently by another request; using the existing one.`
+            );
+            return retryPipelines.data[0];
+          }
+
+          throw error;
+        }
       } else {
         throw new Error(`Pipeline '${pipelineName}' not found.`);
       }

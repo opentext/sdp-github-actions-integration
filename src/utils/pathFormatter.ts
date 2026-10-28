@@ -73,11 +73,15 @@ class PathFormatterService {
   public static async buildJobCiIdPrefix(
     repositoryOwner: string,
     repositoryName: string,
-    workflowFileName: string
+    workflowFileName: string,
+    pipelineNamespace?: string
   ): Promise<string> {
     await PathFormatterService.checkVersion();
     const separator = PathFormatterService.getSeparator();
-    return `${PathFormatterService.getPrefix()}${repositoryOwner}${separator}${repositoryName}${separator}${workflowFileName}`;
+    const prefix = `${PathFormatterService.getPrefix()}${repositoryOwner}${separator}${repositoryName}${separator}${workflowFileName}`;
+    return pipelineNamespace
+      ? `${prefix}${separator}${pipelineNamespace}`
+      : prefix;
   }
 
   public static async buildExecutorCiId(

@@ -38,6 +38,7 @@ import GitHubClient from '../client/githubClient';
 import OctaneClient from '../client/octaneClient';
 import { getConfig } from '../config/config';
 import { Logger } from '../utils/logger';
+import { applyTestFieldOverrides } from '../utils/testFieldOverrides';
 import OctaneBuildConfig from '@microfocus/alm-octane-test-result-convertion/dist/service/OctaneBuildConfig';
 import { stringToFrameworkType } from '@microfocus/alm-octane-test-result-convertion/dist/model/common/FrameworkType';
 
@@ -205,7 +206,11 @@ const sendJUnitTestResults = async (
     workflowRunId,
     buildContext,
     getConfig().unitTestResultsGlobPattern,
-    convertJUnitXMLToOctaneXML,
+    (content: string, options: any, ...extraParams: any[]) =>
+      applyTestFieldOverrides(
+        convertJUnitXMLToOctaneXML(content, options, ...extraParams),
+        { testLevel: getConfig().testLevel, testType: getConfig().testType }
+      ),
     framework ? [stringToFrameworkType(framework)] : undefined
   );
   LOGGER.info('JUnit test results processed and sent successfully.');

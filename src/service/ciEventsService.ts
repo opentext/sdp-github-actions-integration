@@ -162,14 +162,17 @@ const generateRootCiEvent = (
   eventType: CiEventType,
   jobCiIdPrefix: string,
   scmData?: ScmData,
-  parameters?: CiParameter[]
+  parameters?: CiParameter[],
+  runNamePrefix?: string
 ): CiEvent => {
+  const runNumber =
+    event.workflow_run?.run_number?.toString() || pipelineData.buildCiId;
+
   const rootEvent: CiEvent = {
     buildCiId: pipelineData.buildCiId,
     customReportUrl: getWorkflowRunUrl(event),
     eventType,
-    number:
-      event.workflow_run?.run_number?.toString() || pipelineData.buildCiId,
+    number: runNamePrefix ? `${runNamePrefix}#${runNumber}` : runNumber,
     project: `${jobCiIdPrefix}`,
     projectDisplayName: pipelineData.rootJobName,
     startTime: event.workflow_run?.run_started_at

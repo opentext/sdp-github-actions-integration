@@ -28,6 +28,23 @@ inputs:
   pipelineNamePattern:
     description: 'Pattern to build pipeline names'
     required: true
+  preservePipelineNames:
+    description: 'Do not rename existing pipelines based on pipelineNamePattern'
+    required: false
+    default: false
+  flatPipelineMode:
+    description: 'Do not create branch/child pipelines; report runs directly against the parent pipeline'
+    required: false
+    default: false
+  runNamePattern:
+    description: 'Already-resolved label used to prefix the run/build number (e.g. a microservice/component name). Falls back to the resolved pipeline name if not set.'
+    required: false
+  testLevel:
+    description: 'Value of the Test_Level field set on JUnit test results sent to the product (e.g. "System Test"). Defaults to "Unit Test" if not set.'
+    required: false
+  testType:
+    description: 'Value of the Test_Type field set on JUnit test results sent to the product (e.g. "Functional"). Defaults to "Sanity" if not set.'
+    required: false
   unitTestResultsGlobPattern:
     description: 'Pattern to search unit test result report files in artifacts'
     required: false
